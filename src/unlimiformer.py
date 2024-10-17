@@ -966,6 +966,12 @@ class UnlimiformerT5(Unlimiformer[T5Model]):
                 for layer in self.model.base_model.decoder.block[layer_begin:layer_end]
         ]
     
+    def activation_to_capture(self, layer_begin, layer_end): 
+        # if self.use_datastore:
+        #     return [self.model.base_model.encoder.layers[-1]]
+        # else:
+        return self.get_kv_projections(layer_begin, layer_end)
+    
     def attention_op_to_run(self, layer_begin, layer_end):
         return [
             layer.layer[1].EncDecAttention.q
