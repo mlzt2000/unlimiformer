@@ -8,6 +8,7 @@ from transformers import BartModel, BartForConditionalGeneration, \
     LEDModel, LEDForConditionalGeneration, \
     AutoModelForCausalLM, AutoModelForSeq2SeqLM, \
     LlamaModel, LlamaForCausalLM, \
+    OPTModel, OPTForCausalLM, \
     MODEL_WITH_LM_HEAD_MAPPING, MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING
 
 from typing import TypeVar, Generic
@@ -379,6 +380,7 @@ class Unlimiformer(Generic[ModelType]):
             chunk = input_ids[:, context_start_ind:context_end_ind].to(self.device)
             chunk_attention_mask = attention_mask[:, context_start_ind:context_end_ind].to(self.device)
             with torch.inference_mode():
+                # self.model(chunk, attention_mask=chunk_attention_mask)
                 _ = self.model(chunk, attention_mask=chunk_attention_mask, labels=dummy_labels) # , return_dict=True, output_hidden_states=True)
             if self.use_datastore:
                 # TODO: verify with BART as well
@@ -551,6 +553,7 @@ class Unlimiformer(Generic[ModelType]):
                     self.generated_input_ids = torch.cat([self.generated_input_ids, kwargs['decoder_input_ids']], axis=-1)
             
         result = self.original_forward_func(input_ids=input_ids, labels=labels, attention_mask=attention_mask, **kwargs)
+        # result = self.original_forward_func(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         self.is_first_test_decoding_step = False
         return result
 
@@ -812,6 +815,8 @@ class Unlimiformer(Generic[ModelType]):
             LEDForConditionalGeneration: UnlimiformerLED,
             LlamaModel: UnlimiformerLLaMa,
             LlamaForCausalLM: UnlimiformerLLaMa,
+            OPTModel: UnlimiformerOPT,
+            OPTForCausalLM: UnlimiformerOPT
         }
         type_to_class[type(model)](model, *args, **kwargs)
         return model
@@ -1138,6 +1143,65 @@ class UnlimiformerLLaMa(Unlimiformer[LlamaModel]):
         retrieved_keys = (retrieved_keys * cos) + (self.rotate_half(retrieved_keys) * sin)
         return retrieved_keys, retrieved_values
         
+class UnlimiformerOPT(Unlimiformer[OPTModel]):
+    def __init__(self, model: OPTModel, *args, **kwargs):
+        super().__init__(model, *args, **kwargs)
+        
+    def process_key_value(self, capturers):
+        key_capturer, value_capturer = capturers
+        # (batch, time, heads * attn_dim)
+        key, value = key_capturer.captured, value_capturer.captured
+        attention = self.model.base_model.layers[-1].self_attn
+
+        # (batch, heads, time, attn_dim)
+        key = key.view(key.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        value = value.view(value.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
+        
+        return key, value
+    
+    def process_query(self, output):
+        # output: (batch, time, heads * attn_dim)
+        attention = self.model.base_model.layers[-1].self_attn
+        
+        # query: (batch, time, heads, attn_dim)
+        query = output.view(output.shape[0], output.shape[1], attention.num_heads, attention.head_dim).contiguous()
+        return query
+    
+    def get_kv_projections(self, layer_begin, layer_end):
+        return [
+            [layer.self_attn.k_proj, layer.self_attn.v_proj]
+            for layer in self.model.base_model.layers[layer_begin:layer_end]
+        ]
+    
+    def activation_to_capture(self, layer_begin, layer_end): 
+        if self.use_datastore:
+            return [
+                layer.self_attn_layer_norm
+                for layer in self.model.base_model.layers[layer_begin:layer_end]
+            ]
+        else:
+            return self.get_kv_projections(layer_begin, layer_end)
+
+    def attention_op_to_run(self, layer_begin, layer_end):
+        return [
+            layer.self_attn.q_proj
+                for layer in self.model.base_model.layers[layer_begin:layer_end]
+        ]
+
+    def attention_layer_to_run(self, layer_begin, layer_end): 
+        return self.model.base_model.layers[layer_begin:layer_end]
+
+    def self_attention(self, decoder_layer):
+        return decoder_layer.self_attn 
+
+    def cross_attention(self, decoder_layer):
+        return decoder_layer.self_attn
+    
+    def window_size(self):
+        return self.model.config.max_position_embeddings
+    
+    def set_gradient_checkpointing(self, value):
+        self.model.base_model.gradient_checkpointing = value
 
 class ActivationCapturer(nn.Module):
     def __init__(self, layer, capture_input=False):
