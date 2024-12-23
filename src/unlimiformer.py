@@ -14,6 +14,7 @@ from transformers import BartModel, BartForConditionalGeneration, \
 from typing import TypeVar, Generic
 
 from .index_building import Datastore, DatastoreBatch
+from transformers.cache_utils import DynamicCache
 
 logger = logging.getLogger('Unlimiformer')
 logger.setLevel(20)
@@ -122,7 +123,7 @@ class Unlimiformer(Generic[ModelType]):
             if type(layer) is list:
                 layer_capturers = []
                 for k_or_v in layer:
-                    capturer = ActivationCapturer(k_or_v, capture_input=False)
+                    capturer = ActivationCapturer(k_or_v, capture_input=True)
                     layer_capturers.append(capturer)
                     self.register_hook(k_or_v, capturer)
                 self.activation_capturer.append(layer_capturers)
@@ -273,7 +274,7 @@ class Unlimiformer(Generic[ModelType]):
                 decoder_layer_args = self.create_decoder_layer_args(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
-                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_statfes=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
                     layer_head_mask=layer_head_mask,
                     cross_attn_layer_head_mask=cross_attn_layer_head_mask,
@@ -357,7 +358,7 @@ class Unlimiformer(Generic[ModelType]):
         self.prompt_keys, self.prompt_values = None, None
         self.prev_tokens = [None for _ in range(len(self.original_decoder_layer_cross_attn_forward_funcs))]
         self.last_beam_idx = None
-        self.cur_layer_key_value_placeholder = None
+        self.cur_layer_key_value_placeholder: DynamicCache = None
         self.is_input_encoding_pass = True
         if self.is_encoder_decoder:
             dummy_labels = torch.zeros((input_ids.shape[0], 1), dtype=torch.long, device=input_ids.device)
@@ -543,7 +544,7 @@ class Unlimiformer(Generic[ModelType]):
                 # input_ids = input_ids[:, :self.model_encoder_max_len]
                 # labels = labels[:, :self.model_encoder_max_len] if labels is not None else None
             else:
-                if kwargs.get('past_key_values') is None:
+                if kwargs.get('past_key_values') is None or len(kwargs['past_key_values']) == 0:
                     self.is_first_test_decoding_step = True
 
                 if input_ids is not None:
@@ -560,11 +561,13 @@ class Unlimiformer(Generic[ModelType]):
     def create_cross_attn_pre_forward_hook(self, original_cross_attn_forward_func, cur_layer_num):
         def attention_pre_forward_hook(hidden_states, attention_mask=None, *args, **kwargs):
             self.cur_decoder_layer_index = cur_layer_num
-            if kwargs.get('past_key_value') is not None:
+            if kwargs.get('past_key_value') is not None and len(kwargs['past_key_value']) > 0:
                 # it's a tuple, and we convert it to a list to be able to perform assignment 
                 # and modify its items from our attention_forward_hook
-                self.cur_layer_key_value_placeholder = \
-                    kwargs['past_key_value'] = list(kwargs['past_key_value']) # (batch, head, time, attn_dim)
+                # self.cur_layer_key_value_placeholder = \
+                #     kwargs['past_key_value'] = list(kwargs['past_key_value']) # (batch, head, time, attn_dim)
+                # self.cur_layer_key_value_placeholder = list(kwargs['past_key_value'].to_legacy_cache())
+                self.cur_layer_key_value_placeholder = kwargs['past_key_value']
 
             batch_size, tgt_len, dim = hidden_states.shape
             if self.model.training:
@@ -600,7 +603,10 @@ class Unlimiformer(Generic[ModelType]):
         with torch.no_grad():
             prompt_size = self.prompt_input_ids.shape[1]
             generated_size = self.input_ids_size - prompt_size
-            window_size = self.cur_layer_key_value_placeholder[0].shape[-2]
+            # print(f'window_size: {self.cur_layer_key_value_placeholder[0][0]}')
+            # exit()
+            window_size = self.cur_layer_key_value_placeholder[0][0].shape[-2]
+            # window_size = self.cur_layer_key_value_placeholder.key_cache[0].shape[-2]
             # topk = min(self.actual_model_window_size, attn_weights.shape[-1])
             topk = min(prompt_size, window_size)
             if not self.is_encoder_decoder:
@@ -1071,6 +1077,8 @@ class UnlimiformerLLaMa(Unlimiformer[LlamaModel]):
         key, value = key_capturer.captured, value_capturer.captured
         attention = self.model.base_model.layers[-1].self_attn
 
+        # print("Key:", key.shape)
+        # print("Value:", value.shape)
         # (batch, heads, time, attn_dim)
         key = key.view(key.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
         value = value.view(value.shape[0], -1, attention.num_heads, attention.head_dim).transpose(1, 2).contiguous()
